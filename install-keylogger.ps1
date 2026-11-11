@@ -21,6 +21,63 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 if (-not (Test-Path -LiteralPath $package)) { throw "MeshCentral package not found: $package" }
 if (-not (Test-Path -LiteralPath $node)) { throw "Node.js not found: $node" }
 
+# ---------------------------------------------------------------------------
+# Node.js >= 26 compatibility patches for the MeshCentral node_modules tree.
+# On Node 26 the readable-stream internals changed (destroyed is backed by
+# stream state, and streams are auto-destroyed right after 'end'), which
+# hangs yauzl (fd-slicer) and can truncate the LAST file of a plugin zip
+# (pluginHandler). All patches are idempotent and keep a .bak-mckeylog copy.
+# They must be re-applied after any MeshCentral server upgrade.
+# ---------------------------------------------------------------------------
+function Apply-TextPatch {
+    param([string]$File, [string]$Marker, [string[]]$Old, [string[]]$New)
+    if (-not (Test-Path -LiteralPath $File)) {
+        Write-Output "  (skip, not present: $($File | Split-Path -Parent | Split-Path -Leaf))"
+        return
+    }
+    $content = [IO.File]::ReadAllText($File)
+    if ($content.Contains($Marker)) {
+        Write-Output "  (already patched: $([IO.Path]::GetFileName($File)))"
+        return
+    }
+    $nl = if ($content.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $count = [regex]::Matches($content, [regex]::Escape(($Old -join $nl))).Count
+    if ($count -ne 1) {
+        Write-Output "  (warning: pattern found $count time(s) in $([IO.Path]::GetFileName($File)) - skipped; a MeshCentral upgrade may have changed it)"
+        return
+    }
+    Copy-Item -LiteralPath $File -Destination ($File + '.bak-mckeylog') -Force
+    $content = $content.Replace(($Old -join $nl), ($New -join $nl))
+    [IO.File]::WriteAllText($File, $content, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Output "  patched: $([IO.Path]::GetFileName($File))"
+}
+
+function Invoke-NodeCompatPatches {
+    param([string]$NodeModules, [string]$Package)
+    Write-Output 'Applying Node.js >= 26 compatibility patches (idempotent)...'
+    $fdSlicer = Join-Path $NodeModules 'fd-slicer\index.js'
+    # 1a) fd-slicer: push(null) must happen before the destroyed flag is set,
+    #     or the final partial chunk never drains and 'end' never fires.
+    Apply-TextPatch -File $fdSlicer -Marker 'End the stream (push null) before any destroyed-flag' `
+        -Old @('  if (toRead <= 0) {', '    self.destroyed = true;', '    self.push(null);', '    self.context.unref();', '    return;', '  }') `
+        -New @('  if (toRead <= 0) {', '    // [mckeylog node26-compat] End the stream (push null) before any destroyed-flag', '    // work: on Node >= 26, stream.destroyed is backed by internal stream state,', '    // and setting it to true here makes later resume()/pause() calls no-ops,', "    // so the final partial chunk never drains and 'end' never fires (yauzl hang).", '    self.push(null);', '    self.context.unref();', '    return;', '  }')
+    # 1b) fd-slicer: same fix for the bytesRead === 0 path.
+    Apply-TextPatch -File $fdSlicer -Marker 'same as the toRead <= 0 path above' `
+        -Old @('      } else if (bytesRead === 0) {', '        self.destroyed = true;', '        self.push(null);', '        self.context.unref();', '      } else {') `
+        -New @('      } else if (bytesRead === 0) {', '        // [mckeylog node26-compat] same as the toRead <= 0 path above', '        self.push(null);', '        self.context.unref();', '      } else {')
+    # 2) fd-slicer: Node 26 auto-destroys readable streams right after 'end';
+    #     that post-end destroy is normal lifecycle and must stay silent.
+    Apply-TextPatch -File $fdSlicer -Marker 'auto-destroys readable streams right' `
+        -Old @('ReadStream.prototype.destroy = function(err) {', '  if (this.destroyed) return;', '  err = err || new Error("stream destroyed");', '  this.destroyed = true;', "  this.emit('error', err);", '  this.context.unref();', '};') `
+        -New @('ReadStream.prototype.destroy = function(err) {', '  if (this.destroyed) return;', '  this.destroyed = true;', '  // [mckeylog node26-compat auto] Node >= 26 auto-destroys readable streams right', "  // after 'end'. That post-end destroy is normal lifecycle: keep it silent", '  // and skip the unref (the EOF path in _read already released the fd hold).', '  if (!err && this._readableState && this._readableState.ended) {', '    return;', '  }', '  err = err || new Error("stream destroyed");', "  this.emit('error', err);", '  this.context.unref();', '};')
+    # 3) pluginHandler: advance to the next zip entry only after the file is
+    #     fully written, or the last entry can come out empty.
+    Apply-TextPatch -File (Join-Path $Package 'pluginHandler.js') -Marker 'mckeylog compat' `
+        -Old @("                                            readStream.on('end', function () { zipfile.readEntry(); });", "                                            if (process.platform == 'win32') {", "                                                readStream.pipe(obj.fs.createWriteStream(filePath));", "                                            } else {", "                                                var fileMode = (entry.externalFileAttributes >> 16) & 0x0fff;", "                                                if( fileMode <= 0 ) fileMode = 0o644;", "                                                readStream.pipe(obj.fs.createWriteStream(filePath, { mode: fileMode }));", "                                            }") `
+        -New @("                                            // [mckeylog compat] advance to the next entry only after the file is fully", "                                            // written: the source stream 'end' fires before the write stream's buffer", "                                            // flushes, which can leave the LAST entry in the zip empty.", "                                            if (process.platform == 'win32') {", "                                                var ws = obj.fs.createWriteStream(filePath);", "                                            } else {", "                                                var fileMode = (entry.externalFileAttributes >> 16) & 0x0fff;", "                                                if( fileMode <= 0 ) fileMode = 0o644;", "                                                var ws = obj.fs.createWriteStream(filePath, { mode: fileMode });", "                                            }", "                                            ws.on('finish', function () { zipfile.readEntry(); });", "                                            readStream.pipe(ws);")
+    Write-Output 'Node.js compatibility patches done.'
+}
+
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $work = Join-Path ([IO.Path]::GetTempPath()) ('mckeylog-' + $stamp)
 $archive = Join-Path $work 'meshcentral-keylogger.zip'
@@ -71,6 +128,7 @@ try {
     Copy-Item -Path (Join-Path $sourceRoot '*') -Destination $plugin -Recurse -Force
     & $node (Join-Path $sourceRoot 'scripts\patch_meshcentral.js') $package
     if ($LASTEXITCODE -ne 0) { throw "MeshCentral patch exited with code $LASTEXITCODE" }
+    Invoke-NodeCompatPatches -NodeModules (Join-Path $MeshCentralRoot 'node_modules') -Package $package
 
     if ($null -ne $service) {
         Write-Output "Starting $ServiceName..."

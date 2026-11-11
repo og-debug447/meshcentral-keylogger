@@ -1,7 +1,7 @@
 {
   "name": "MeshCentral Keylogger",
   "shortName": "mckeylog",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "MeshCentral Keylogger contributors",
   "description": "Keylogs tab: watch keystrokes live and browse previous keylog files on Windows devices.",
   "hasAdminPanel": false,

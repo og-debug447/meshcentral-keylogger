@@ -54,6 +54,33 @@ for (const dir of projectDirs) {
     }
 }
 
+// Add the "keylog-worker" command branch so the service executable can be
+// re-launched inside the interactive user's session (see
+// ILibDuktape_Keylogger.c). Without this branch a session 0 agent has no
+// way to capture the console user's keystrokes.
+edit(path.join('meshservice', 'ServiceMain.c'), function (source) {
+    if (source.includes('keylog-worker')) { return source; }
+    const marker = 'if (argc > 1 && (strcasecmp(argv[1], "-finstall") == 0';
+    const at = source.indexOf(marker);
+    if (at < 0) throw new Error('ServiceMain.c -finstall anchor changed');
+    const newline = source.includes('\r\n') ? '\r\n' : '\n';
+    const branch = [
+        '\t/* User-session keylog worker (see ILibDuktape_Keylogger.c). Runs the',
+        '\t * keyboard hook inside the interactive user\'s session and sends the',
+        '\t * formatted lines back to the agent over a named pipe. */',
+        '\tif (argc > 1 && strcasecmp(argv[1], "keylog-worker") == 0)',
+        '\t{',
+        '\t\tretCode = ILibDuktape_KeyloggerWorker_Run(argc, argv);',
+        '\t\targv[argc] = NULL; /* wmain_free releases argc+1 slots */',
+        '\t\twmain_free(argv);',
+        '\t\treturn retCode;',
+        '\t}',
+        '',
+        ''
+    ].join(newline);
+    return source.slice(0, at) + branch + source.slice(at);
+});
+
 edit('makefile', function (source) {
     if (source.includes('microscript/ILibDuktape_Keylogger.c')) return source;
     const marker = 'SOURCES += microscript/ILibDuktape_ScriptContainer.c';

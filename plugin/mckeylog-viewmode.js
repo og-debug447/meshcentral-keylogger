@@ -42,10 +42,41 @@
         if (b != null) { b.value = (activeSession != null) ? 'Disconnect' : 'Connect'; }
     }
 
+    /* "YYYY-MM-DD HH:MM:SS  -  Window: <title>" lines from the agent are
+     * window-change markers; they are highlighted like NanoCore does. */
+    var WINDOW_LINE_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}  -  Window: /;
+
+    function ensureLiveStyle() {
+        if (document.getElementById('mckeylog-live-style') != null) { return; }
+        var st = document.createElement('style');
+        st.id = 'mckeylog-live-style';
+        st.textContent = '#p61live .mckl-win{color:#4fc3f7;font-weight:bold}';
+        document.head.appendChild(st);
+    }
+
+    function lineHtml(line) {
+        if (WINDOW_LINE_RE.test(line)) {
+            return '<span class="mckl-win">' + escapeHtml(line) + '</span>';
+        }
+        return escapeHtml(line);
+    }
+
     function renderLive() {
         var live = el('p61live');
         if (live == null) { return; }
-        live.textContent = lines.join('\n');
+        ensureLiveStyle();
+        var html = '';
+        var first = true;
+        var i, j, parts;
+        for (i = 0; i < lines.length; i++) {
+            parts = String(lines[i]).split('\n');
+            for (j = 0; j < parts.length; j++) {
+                if (!first) { html += '\n'; }
+                first = false;
+                html += lineHtml(parts[j]);
+            }
+        }
+        live.innerHTML = html;
         var auto = el('p61autoscroll');
         if (auto == null || auto.checked) { live.scrollTop = live.scrollHeight; }
     }
