@@ -44,6 +44,14 @@ try {
         $serviceWasRunning = $true
     }
 
+    # MeshCentral creates the signed agent cache while running as SYSTEM, so
+    # the cached agents can end up with an ACL (SYSTEM full control,
+    # Administrators read only) that blocks even an elevated administrator.
+    # Take ownership and grant the current administrator full control before
+    # replacing anything.
+    takeown /F "$signed\*" /A /DY 2>$null | Out-Null
+    & icacls.exe "$signed\*" /grant "$($identity.Name):(F)" /C | Out-Null
+
     # Back up the current signed agents, then replace x86/x64 only.
     # MeshServiceARM64.exe and any other user-placed agents are left alone.
     $existing = Get-ChildItem -LiteralPath $signed -Filter 'MeshService*.exe' -ErrorAction SilentlyContinue
