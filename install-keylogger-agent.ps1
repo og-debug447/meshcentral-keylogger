@@ -32,8 +32,17 @@ function Grant-FullControl([string]$dir) {
     # MeshCentral runs as SYSTEM, so folders and files it created can end up
     # with ACLs that block even an elevated administrator. Take ownership and
     # grant the current administrator full control before replacing anything.
-    takeown /F "$dir\*" /A /DY 2>$null | Out-Null
-    & icacls.exe "$dir\*" /grant "$($identity.Name):(F)" /C 2>$null | Out-Null
+    # takeown/icacls write progress and errors to stderr, which PowerShell
+    # would turn into terminating errors under $ErrorActionPreference = 'Stop',
+    # so run them with the preference temporarily relaxed and their output muted.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        takeown /F "$dir\*" /A 2>$null | Out-Null
+        & icacls.exe "$dir\*" /grant "$($identity.Name):(F)" /C 2>$null | Out-Null
+    } finally {
+        $ErrorActionPreference = $previous
+    }
 }
 
 try {
@@ -53,7 +62,8 @@ try {
     if ($null -ne $service -and $service.Status -ne 'Stopped') {
         Write-Output "Stopping $ServiceName while the agent cache is updated..."
         Stop-Service -Name $ServiceName -Force
-        (Get-Service -Name $ServiceName).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(45))
+        $stopped = (Get-Service -Name $ServiceName).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(90))
+        if (-not $stopped) { throw "Service $ServiceName did not stop within 90 seconds" }
         $serviceWasRunning = $true
     }
 
@@ -97,9 +107,14 @@ try {
     if ($serviceWasRunning) {
         try {
             $currentService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-            if ($null -ne $currentService -and $currentService.Status -eq 'Stopped') {
-                Start-Service -Name $ServiceName
-                (Get-Service -Name $ServiceName).WaitForStatus('Running', [TimeSpan]::FromSeconds(45))
+            if ($null -ne $currentService) {
+                if ($currentService.Status -eq 'Stopping') {
+                    $currentService.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60)) | Out-Null
+                }
+                if ((Get-Service -Name $ServiceName).Status -eq 'Stopped') {
+                    Start-Service -Name $ServiceName
+                    (Get-Service -Name $ServiceName).WaitForStatus('Running', [TimeSpan]::FromSeconds(45))
+                }
             }
         } catch { Write-Output "MeshCentral service recovery failed: $($_.Exception.Message)" }
     }
