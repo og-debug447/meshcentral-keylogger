@@ -62,6 +62,12 @@ try {
     # administrator access before replacing the old plugin tree.
     & icacls.exe $plugin /grant "$($identity.Name):(OI)(CI)(F)" /T /C | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Could not update plugin permissions: $plugin" }
+    # The MeshCentral server runs as SYSTEM and re-extracts plugin files from
+    # GitHub whenever the admin Plugins page installs/updates a plugin. It must
+    # be able to overwrite every file in the tree or the server crashes with an
+    # unhandled EPERM stream error while enabling the plugin.
+    & icacls.exe $plugin /grant 'NT AUTHORITY\SYSTEM:(OI)(CI)(F)' /T /C | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not grant the MeshCentral service access to the plugin files' }
     Copy-Item -Path (Join-Path $sourceRoot '*') -Destination $plugin -Recurse -Force
     & $node (Join-Path $sourceRoot 'scripts\patch_meshcentral.js') $package
     if ($LASTEXITCODE -ne 0) { throw "MeshCentral patch exited with code $LASTEXITCODE" }
